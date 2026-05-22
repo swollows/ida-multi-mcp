@@ -2994,5 +2994,328 @@
       "required": [],
       "additionalProperties": false
     }
+  },
+  {
+    "name": "entity_query",
+    "description": "Query IDB entities with filtering, projection, sorting, and pagination.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "queries": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            {
+              "type": "object"
+            }
+          ],
+          "description": "Entity query or list of queries. kind=functions|globals|imports|strings|names."
+        }
+      },
+      "required": [
+        "queries"
+      ]
+    },
+    "outputSchema": {
+      "type": "object"
+    }
+  },
+  {
+    "name": "search_text",
+    "description": "Search the rendered IDA listing for disassembly/comment text using IDA's native text search.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "description": "Text or regex pattern to search for"
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Max hits per page (default: 30, max: 500)"
+        },
+        "start": {
+          "type": "string",
+          "description": "Cursor address to resume from"
+        },
+        "regex": {
+          "type": "boolean",
+          "description": "Treat pattern as regex"
+        },
+        "case_sensitive": {
+          "type": "boolean",
+          "description": "Use case-sensitive matching"
+        },
+        "include": {
+          "type": "string",
+          "description": "'disasm', 'comments', or 'all'"
+        },
+        "code_only": {
+          "type": "boolean",
+          "description": "Restrict search to executable segments"
+        }
+      },
+      "required": [
+        "pattern"
+      ]
+    },
+    "outputSchema": {
+      "type": "object"
+    }
+  },
+  {
+    "name": "py_exec_file",
+    "description": "Execute a Python script file in IDA context and return result/stdout/stderr.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Absolute path to a Python script to execute"
+        }
+      },
+      "required": [
+        "file_path"
+      ]
+    },
+    "outputSchema": {
+      "type": "object"
+    }
+  },
+  {
+    "name": "make_signature",
+    "description": "Create unique byte signatures for addresses or names.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "addrs": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Address(es) or name(s)"
+        },
+        "format": {
+          "type": "string",
+          "description": "ida, x64dbg, mask, or bitmask"
+        },
+        "wildcard_operands": {
+          "type": "boolean",
+          "description": "Wildcard instruction operands"
+        },
+        "max_length": {
+          "type": "integer",
+          "description": "Maximum signature length in bytes"
+        }
+      },
+      "required": [
+        "addrs"
+      ]
+    },
+    "outputSchema": {
+      "type": "object"
+    }
+  },
+  {
+    "name": "make_signature_for_function",
+    "description": "Create unique byte signatures for function entry points.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "addrs": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Function address(es) or name(s)"
+        },
+        "format": {
+          "type": "string",
+          "description": "ida, x64dbg, mask, or bitmask"
+        },
+        "wildcard_operands": {
+          "type": "boolean",
+          "description": "Wildcard instruction operands"
+        },
+        "max_length": {
+          "type": "integer",
+          "description": "Maximum signature length in bytes"
+        }
+      },
+      "required": [
+        "addrs"
+      ]
+    },
+    "outputSchema": {
+      "type": "object"
+    }
+  },
+  {
+    "name": "make_signature_for_range",
+    "description": "Create a byte signature for a specific address range.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "string",
+          "description": "Start address or name"
+        },
+        "end": {
+          "type": "string",
+          "description": "End address or name, exclusive"
+        },
+        "format": {
+          "type": "string",
+          "description": "ida, x64dbg, mask, or bitmask"
+        },
+        "wildcard_operands": {
+          "type": "boolean",
+          "description": "Wildcard instruction operands"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ]
+    },
+    "outputSchema": {
+      "type": "object"
+    }
+  },
+  {
+    "name": "find_xref_signatures",
+    "description": "Find unique signatures for code locations that reference an address.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "addrs": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Address(es) or name(s)"
+        },
+        "format": {
+          "type": "string",
+          "description": "ida, x64dbg, mask, or bitmask"
+        },
+        "top": {
+          "type": "integer",
+          "description": "Number of shortest signatures per address"
+        },
+        "max_length": {
+          "type": "integer",
+          "description": "Maximum signature length in bytes"
+        }
+      },
+      "required": [
+        "addrs"
+      ]
+    },
+    "outputSchema": {
+      "type": "object"
+    }
+  },
+  {
+    "name": "type_query",
+    "description": "Query local types with structured filters, relationships, and pagination.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "queries": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            {
+              "type": "object"
+            }
+          ],
+          "description": "Type query or list of queries"
+        }
+      },
+      "required": [
+        "queries"
+      ]
+    },
+    "outputSchema": {
+      "type": "object"
+    }
+  },
+  {
+    "name": "type_inspect",
+    "description": "Inspect named types and optionally include member layout.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "queries": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            {
+              "type": "object"
+            }
+          ],
+          "description": "Type inspection query or list of queries"
+        }
+      },
+      "required": [
+        "queries"
+      ]
+    },
+    "outputSchema": {
+      "type": "object"
+    }
+  },
+  {
+    "name": "type_apply_batch",
+    "description": "Apply multiple type edits and return aggregate status.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "batch": {
+          "type": "object",
+          "description": "Batch with edits and optional stop_on_error"
+        }
+      },
+      "required": [
+        "batch"
+      ]
+    },
+    "outputSchema": {
+      "type": "object"
+    }
   }
 ]

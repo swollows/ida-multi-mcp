@@ -1,12 +1,25 @@
 # ida-pro-mcp (upstream) vs ida-multi-mcp — Comparison
 
-Last updated: 2026-04-16 (upstream commit `d80ed7f`)
+Last updated: 2026-05-23 (upstream commit `c92625e`)
 
 This document tracks what upstream features/fixes ida-multi-mcp has NOT yet adopted.
 
 ## Current Coverage
 
-After PRs #2–#8, ida-multi-mcp has ported or implemented equivalents of most upstream tools. The remaining gaps are **bugfixes, optimizations, and minor features** rather than major missing tool categories.
+After the 2026-05-23 parity pass, ida-multi-mcp has ported or implemented multi-instance equivalents for the current upstream tool categories that do not conflict with the explicit `instance_id` routing contract.
+
+## Newly Adopted in 2026-05-23 Parity Pass
+
+| Upstream feature | ida-multi-mcp implementation |
+|---|---|
+| Signature tools: `make_signature`, `make_signature_for_function`, `make_signature_for_range`, `find_xref_signatures` | Ported via `src/ida_multi_mcp/ida_mcp/api_sigmaker.py` and vendored `_sigmaker.py` |
+| Generic entity/text search: `entity_query`, `search_text` | Added to `src/ida_multi_mcp/ida_mcp/api_core.py` |
+| Type catalog tools: `type_query`, `type_inspect`, `type_apply_batch` | Added to `src/ida_multi_mcp/ida_mcp/api_types.py` |
+| Script execution: `py_exec_file` | Added to `src/ida_multi_mcp/ida_mcp/api_python.py` and marked unsafe like `py_eval` |
+| Debugger convenience tools and breakpoint conditions | Added to `src/ida_multi_mcp/ida_mcp/api_debug.py`; still follow the existing `dbg` extension visibility behavior |
+| Static schema visibility | Updated `src/ida_multi_mcp/ida_tool_schemas.json` so non-debug parity tools are advertised before any IDA instance connects |
+
+Upstream direct-instance tools (`select_instance`, GUI `open_file`) are not ported as standalone tools because ida-multi-mcp intentionally routes by `instance_id` through the central server. Their operational coverage is provided by `list_instances`, required per-call `instance_id`, and headless `idalib_open`.
 
 ---
 

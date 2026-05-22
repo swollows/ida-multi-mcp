@@ -2,11 +2,12 @@
 
 import re
 import time
-from typing import Annotated, Optional
+from typing import Annotated, Any, NotRequired, Optional, TypedDict
 
 import ida_auto
 import ida_funcs
 import ida_hexrays
+import ida_lines
 import ida_loader
 import idaapi
 import idautils
@@ -14,6 +15,11 @@ import ida_nalt
 import ida_typeinf
 import ida_segment
 import idc
+
+try:
+    import ida_search
+except ImportError:
+    ida_search = None
 
 from .rpc import tool
 from .sync import idasync, tool_timeout
@@ -136,6 +142,50 @@ from .utils import (
 from .sync import IDAError
 
 
+class EntityQuery(TypedDict):
+    """Generic IDB entity query with filtering, projection, and pagination."""
+
+    kind: Annotated[str, "functions|globals|imports|strings|names"]
+    filter: NotRequired[Annotated[str, "Glob/regex filter"]]
+    regex: NotRequired[Annotated[str, "Regex on primary text field"]]
+    min_addr: NotRequired[Annotated[str, "Min address bound"]]
+    max_addr: NotRequired[Annotated[str, "Max address bound"]]
+    segment: NotRequired[Annotated[str, "Segment filter"]]
+    module: NotRequired[Annotated[str, "Import module filter"]]
+    offset: NotRequired[Annotated[int, "Start index"]]
+    count: NotRequired[Annotated[int, "Max results (0=all)"]]
+    sort_by: NotRequired[Annotated[str, "Sort: addr|name|size|length"]]
+    descending: NotRequired[Annotated[bool, "Descending"]]
+    fields: NotRequired[Annotated[list[str], "Projection field list"]]
+
+
+class EntityQueryPage(TypedDict, total=False):
+    kind: str
+    data: list[dict[str, Any]]
+    next_offset: int | None
+    total: int
+    error: str | None
+
+
+class SearchTextLine(TypedDict, total=False):
+    kind: str
+    text: str
+
+
+class SearchTextHit(TypedDict, total=False):
+    addr: str
+    function: str
+    segment: str
+    matches: list[SearchTextLine]
+
+
+class SearchTextResult(TypedDict, total=False):
+    n: int
+    hits: list[SearchTextHit]
+    cursor: dict[str, Any]
+    error: str
+
+
 # ============================================================================
 # Core API Functions
 # ============================================================================
@@ -160,6 +210,121 @@ def _parse_func_query(query: str) -> int:
             pass
 
     return idaapi.BADADDR
+
+
+def _coerce_sort_number(value, default: int = 0) -> int:
+    """Parse decimal or prefixed string numbers used by generic entity rows."""
+    if value in (None, ""):
+        return default
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value), 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _segment_name_for_ea(ea: int) -> str | None:
+    seg = idaapi.getseg(ea)
+    if not seg:
+        return None
+    try:
+        return ida_segment.get_segm_name(seg)
+    except Exception:
+        try:
+            return idaapi.get_segm_name(seg)
+        except Exception:
+            return None
+
+
+def _primary_text_key(kind: str) -> str:
+    if kind == "strings":
+        return "text"
+    return "name"
+
+
+def _collect_entities(kind: str) -> list[dict]:
+    if kind == "functions":
+        rows: list[dict] = []
+        for ea in idautils.Functions():
+            fn = idaapi.get_func(ea)
+            if not fn:
+                continue
+            size_int = fn.end_ea - fn.start_ea
+            rows.append({
+                "kind": "function",
+                "addr": hex(fn.start_ea),
+                "name": ida_funcs.get_func_name(fn.start_ea) or "<unnamed>",
+                "size": hex(size_int),
+                "size_int": size_int,
+                "segment": _segment_name_for_ea(fn.start_ea),
+                "has_type": bool(ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), fn.start_ea)),
+            })
+        return rows
+
+    if kind == "globals":
+        rows = []
+        for ea, name in idautils.Names():
+            if idaapi.get_func(ea) or name is None:
+                continue
+            rows.append({
+                "kind": "global",
+                "addr": hex(ea),
+                "name": name,
+                "size": idc.get_item_size(ea),
+                "segment": _segment_name_for_ea(ea),
+            })
+        return rows
+
+    if kind == "imports":
+        rows = []
+        for imp in _collect_imports():
+            rows.append({
+                "kind": "import",
+                "addr": imp["addr"],
+                "name": imp["imported_name"],
+                "module": imp["module"],
+            })
+        return rows
+
+    if kind == "strings":
+        rows = []
+        for ea, text in _get_strings_cache():
+            rows.append({
+                "kind": "string",
+                "addr": hex(ea),
+                "text": text,
+                "length": len(text),
+                "segment": _segment_name_for_ea(ea),
+            })
+        return rows
+
+    if kind == "names":
+        rows = []
+        imports_by_ea = {int(imp["addr"], 16): imp for imp in _collect_imports()}
+        for ea, name in idautils.Names():
+            rows.append({
+                "kind": "name",
+                "addr": hex(ea),
+                "name": name,
+                "segment": _segment_name_for_ea(ea),
+                "is_function": bool(idaapi.get_func(ea)),
+                "is_import": ea in imports_by_ea,
+            })
+        return rows
+
+    return []
+
+
+def _apply_projection(items: list[dict], fields: list[str] | None) -> list[dict]:
+    if not fields:
+        return items
+    normalized = [str(f).strip() for f in fields if str(f).strip()]
+    if not normalized:
+        return items
+    keep = set(normalized)
+    keep.add("kind")
+    return [{k: v for k, v in item.items() if k in keep} for item in items]
 
 
 @tool
@@ -336,6 +501,107 @@ def list_globals(
 
 @tool
 @idasync
+def entity_query(
+    queries: Annotated[
+        list[EntityQuery] | EntityQuery,
+        "Generic entity query with filtering, projection, and pagination",
+    ],
+) -> list[EntityQueryPage]:
+    """Query IDB entities with typed filters, projection, and pagination."""
+    queries = normalize_dict_list(queries)
+    results: list[dict] = []
+
+    for query in queries:
+        kind = str(query.get("kind", "functions") or "functions").lower()
+        if kind not in {"functions", "globals", "imports", "strings", "names"}:
+            results.append({
+                "kind": kind,
+                "data": [],
+                "next_offset": None,
+                "total": 0,
+                "error": f"Unsupported kind: {kind}",
+            })
+            continue
+
+        rows = _collect_entities(kind)
+        primary_key = _primary_text_key(kind)
+        filter_pattern = str(query.get("filter", "") or "")
+        if filter_pattern:
+            rows = pattern_filter(rows, filter_pattern, primary_key)
+
+        regex = str(query.get("regex", "") or "")
+        if regex:
+            try:
+                compiled = re.compile(regex)
+                rows = [row for row in rows if compiled.search(str(row.get(primary_key, "")))]
+            except re.error:
+                rows = []
+
+        segment_filter = str(query.get("segment", "") or "")
+        if segment_filter and kind in {"functions", "globals", "strings", "names"}:
+            rows = pattern_filter(rows, segment_filter, "segment")
+
+        module_filter = str(query.get("module", "") or "")
+        if module_filter and kind == "imports":
+            rows = pattern_filter(rows, module_filter, "module")
+
+        min_addr = query.get("min_addr")
+        if min_addr not in (None, ""):
+            try:
+                min_ea = parse_address(min_addr)
+                rows = [row for row in rows if int(str(row["addr"]), 16) >= min_ea]
+            except Exception:
+                rows = []
+
+        max_addr = query.get("max_addr")
+        if max_addr not in (None, ""):
+            try:
+                max_ea = parse_address(max_addr)
+                rows = [row for row in rows if int(str(row["addr"]), 16) <= max_ea]
+            except Exception:
+                rows = []
+
+        sort_by = str(query.get("sort_by", "addr") or "addr")
+        descending = bool(query.get("descending", False))
+        if sort_by == "addr":
+            rows.sort(key=lambda row: int(str(row.get("addr", "0x0")), 16), reverse=descending)
+        elif sort_by in {"size", "length"}:
+            rows.sort(
+                key=lambda row: row.get("size_int", _coerce_sort_number(row.get(sort_by, 0))),
+                reverse=descending,
+            )
+        else:
+            rows.sort(key=lambda row: str(row.get(sort_by, "")).lower(), reverse=descending)
+
+        offset = int(query.get("offset", 0) or 0)
+        count = int(query.get("count", 100) or 100)
+        page = paginate(rows, offset, count)
+        data = [{k: v for k, v in item.items() if k != "size_int"} for item in page["data"]]
+
+        fields_raw = query.get("fields")
+        fields = None
+        if fields_raw is not None:
+            if isinstance(fields_raw, str):
+                fields = normalize_list_input(fields_raw)
+            elif isinstance(fields_raw, list):
+                fields = [str(f) for f in fields_raw]
+            else:
+                fields = [str(fields_raw)]
+        data = _apply_projection(data, fields)
+
+        results.append({
+            "kind": kind,
+            "data": data,
+            "next_offset": page["next_offset"],
+            "total": len(rows),
+            "error": None,
+        })
+
+    return results
+
+
+@tool
+@idasync
 def imports(
     offset: Annotated[int, "Offset"],
     count: Annotated[int, "Count (0=all)"],
@@ -406,6 +672,192 @@ def find_regex(
         "matches": matches,
         "cursor": {"next": offset + limit} if more else {"done": True},
     }
+
+
+_COMMENT_SCOLORS = tuple(
+    value for value in (
+        getattr(ida_lines, "SCOLOR_REGCMT", None),
+        getattr(ida_lines, "SCOLOR_RPTCMT", None),
+        getattr(ida_lines, "SCOLOR_AUTOCMT", None),
+        getattr(ida_lines, "SCOLOR_COLLAPSED", None),
+    )
+    if value is not None
+)
+
+
+def _line_is_comment(tagged: str) -> bool:
+    """A rendered listing line is a comment if it carries any comment SCOLOR tag."""
+    if not tagged:
+        return False
+    for sc in _COMMENT_SCOLORS:
+        if ida_lines.COLOR_ON + sc in tagged:
+            return True
+    return False
+
+
+def _classify_hit_lines(
+    ea: int,
+    matcher,
+    want_disasm: bool,
+    want_comments: bool,
+    max_lines: int = 32,
+) -> list[SearchTextLine]:
+    """Render the listing for an EA once and return matching lines."""
+    out: list[SearchTextLine] = []
+    try:
+        result = ida_lines.generate_disassembly(ea, max_lines, False, False)
+    except Exception:
+        return out
+
+    lines = None
+    if isinstance(result, tuple):
+        for item in result:
+            if isinstance(item, (list, tuple)) and item and isinstance(item[0], str):
+                lines = list(item)
+                break
+    if lines is None:
+        return out
+
+    for tagged in lines:
+        text = ida_lines.tag_remove(tagged) or ""
+        if not text or not matcher(text):
+            continue
+        is_cmt = _line_is_comment(tagged)
+        kind = "comment" if is_cmt else "disasm"
+        if kind == "disasm" and not want_disasm:
+            continue
+        if kind == "comment" and not want_comments:
+            continue
+        out.append({"kind": kind, "text": text})
+    return out
+
+
+def _exec_segments() -> list[tuple[int, int]]:
+    """Return executable segment ranges in address order."""
+    ranges: list[tuple[int, int]] = []
+    for seg_ea in idautils.Segments():
+        seg = idaapi.getseg(seg_ea)
+        if not seg:
+            continue
+        if not (seg.perm & idaapi.SEGPERM_EXEC):
+            continue
+        ranges.append((seg.start_ea, seg.end_ea))
+    return ranges
+
+
+def _all_segments() -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    for seg_ea in idautils.Segments():
+        seg = idaapi.getseg(seg_ea)
+        if seg:
+            ranges.append((seg.start_ea, seg.end_ea))
+    return ranges
+
+
+@tool
+@idasync
+def search_text(
+    pattern: Annotated[str, "Text to search for in the rendered listing"],
+    limit: Annotated[int, "Max hits per page (default: 30, max: 500)"] = 30,
+    start: Annotated[str, "Cursor address to resume from. Empty = first segment."] = "",
+    regex: Annotated[bool, "Treat pattern as a regex"] = False,
+    case_sensitive: Annotated[bool, "Case-sensitive match"] = False,
+    include: Annotated[str, "'disasm' | 'comments' | 'all'"] = "all",
+    code_only: Annotated[bool, "Restrict search to executable segments"] = True,
+) -> SearchTextResult:
+    """Search the rendered listing using IDA's native text search."""
+    if ida_search is None:
+        return {"n": 0, "hits": [], "cursor": {"done": True}, "error": "ida_search module unavailable"}
+
+    if limit <= 0:
+        limit = 30
+    if limit > 500:
+        limit = 500
+
+    include = (include or "all").lower()
+    if include not in ("disasm", "comments", "all"):
+        return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid include: {include!r}"}
+
+    want_disasm = include in ("disasm", "all")
+    want_comments = include in ("comments", "all")
+
+    if regex:
+        try:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            rx = re.compile(pattern, flags)
+        except re.error as e:
+            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid regex: {e}"}
+        matcher = lambda s: bool(rx.search(s))
+    else:
+        if case_sensitive:
+            needle = pattern
+            matcher = lambda s: needle in s
+        else:
+            needle = pattern.lower()
+            matcher = lambda s: needle in s.lower()
+
+    sflag = ida_search.SEARCH_DOWN | ida_search.SEARCH_NOSHOW
+    if case_sensitive:
+        sflag |= ida_search.SEARCH_CASE
+    if regex:
+        sflag |= ida_search.SEARCH_REGEX
+
+    segments = _exec_segments() if code_only else _all_segments()
+    if not segments:
+        return {"n": 0, "hits": [], "cursor": {"done": True}}
+
+    if start:
+        try:
+            cursor_ea = parse_address(start)
+        except Exception as e:
+            return {"n": 0, "hits": [], "cursor": {"done": True}, "error": f"invalid start: {e}"}
+    else:
+        cursor_ea = segments[0][0]
+
+    hits: list[SearchTextHit] = []
+    next_cursor: int | None = None
+    seg_idx = 0
+    while seg_idx < len(segments) and segments[seg_idx][1] <= cursor_ea:
+        seg_idx += 1
+    if seg_idx < len(segments) and cursor_ea < segments[seg_idx][0]:
+        cursor_ea = segments[seg_idx][0]
+
+    while seg_idx < len(segments) and len(hits) < limit:
+        seg_start, seg_end = segments[seg_idx]
+        ea = ida_search.find_text(cursor_ea, 0, 0, pattern, sflag)
+        if ea == idaapi.BADADDR or ea >= seg_end:
+            seg_idx += 1
+            if seg_idx < len(segments):
+                cursor_ea = segments[seg_idx][0]
+            continue
+        if ea < seg_start:
+            cursor_ea = ea + 1
+            continue
+
+        lines = _classify_hit_lines(ea, matcher, want_disasm, want_comments)
+        if lines:
+            entry: SearchTextHit = {"addr": hex(ea), "matches": lines}
+            func = idaapi.get_func(ea)
+            if func is not None:
+                fname = ida_funcs.get_func_name(func.start_ea)
+                if fname:
+                    entry["function"] = fname
+            seg = idaapi.getseg(ea)
+            if seg is not None:
+                sname = ida_segment.get_segm_name(seg)
+                if sname:
+                    entry["segment"] = sname
+            hits.append(entry)
+            if len(hits) >= limit:
+                size = max(1, idaapi.get_item_size(ea))
+                next_cursor = ea + size
+                break
+
+        size = idaapi.get_item_size(ea)
+        cursor_ea = ea + (size if size > 0 else 1)
+
+    cursor: dict[str, Any] = {"next": hex(next_cursor)} if next_cursor is not None else {"done": True}
+    return {"n": len(hits), "hits": hits, "cursor": cursor}
 
 
 # ============================================================================
@@ -623,4 +1075,3 @@ def idb_save(
         return result
     except Exception as e:
         return {"ok": False, "path": path or None, "error": str(e)}
-

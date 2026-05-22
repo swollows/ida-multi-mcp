@@ -663,7 +663,7 @@ class IdaMultiMcpServer:
             schema["inputSchema"] = input_schema
 
             # Append warnings to specific tool descriptions
-            if schema.get("name") == "py_eval":
+            if schema.get("name") in ("py_eval", "py_exec_file"):
                 schema["description"] = (
                     schema.get("description", "") +
                     _SINGLE_THREAD_WARNING +
@@ -721,7 +721,7 @@ class IdaMultiMcpServer:
                 tool_schema["inputSchema"] = input_schema
 
                 # Append warnings to specific tool descriptions
-                if tool.get("name") == "py_eval":
+                if tool.get("name") in ("py_eval", "py_exec_file"):
                     tool_schema["description"] = (
                         tool_schema.get("description", "") +
                         _SINGLE_THREAD_WARNING +

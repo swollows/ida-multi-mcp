@@ -1,5 +1,6 @@
-from typing import Annotated
+from typing import Annotated, Any, NotRequired, TypedDict
 
+import idc
 import ida_typeinf
 import ida_hexrays
 import ida_nalt
@@ -13,6 +14,8 @@ from .sync import idasync, ida_major
 from .utils import (
     normalize_list_input,
     normalize_dict_list,
+    paginate,
+    pattern_filter,
     parse_address,
     get_type_by_name,
     parse_decls_ctypes,
@@ -24,6 +27,86 @@ from .utils import (
     read_bytes_bss_safe,
     read_int_bss_safe,
 )
+
+
+class TypeInspectQuery(TypedDict):
+    """Type inspection request."""
+
+    name: Annotated[str, "Type name"]
+    include_members: NotRequired[Annotated[bool, "Include UDT member details"]]
+    max_members: NotRequired[Annotated[int, "Max members"]]
+
+
+class TypeQuery(TypedDict, total=False):
+    """Type catalog query with filtering, pagination, and optional relationships."""
+
+    filter: Annotated[str, "Name glob/regex"]
+    kind: Annotated[str, "any|struct|union|enum|typedef|func|ptr|udt"]
+    offset: Annotated[int, "Start index"]
+    count: Annotated[int, "Max results (0=all)"]
+    sort_by: Annotated[str, "Sort: name|size|ordinal"]
+    descending: Annotated[bool, "Descending"]
+    include_decl: Annotated[bool, "Include declaration text"]
+    include_members: Annotated[bool, "Include UDT member details"]
+    max_members: Annotated[int, "Max members per UDT"]
+    include_relationships: Annotated[bool, "Include related type names"]
+
+
+class TypeApplyBatch(TypedDict):
+    """Batch type application configuration."""
+
+    edits: Annotated[list[TypeEdit] | TypeEdit, "Type edits to apply"]
+    stop_on_error: NotRequired[Annotated[bool, "Stop on first failure"]]
+
+
+class TypeCatalogMemberResult(TypedDict):
+    name: str
+    offset: str
+    size: int
+    type: str
+
+
+class TypeCatalogRow(TypedDict, total=False):
+    ordinal: int
+    name: str
+    size: int
+    kind: str
+    declaration: str
+    member_count: int
+    members: list[TypeCatalogMemberResult]
+    members_truncated: bool
+    related_count: int
+    related_types: list[str]
+    related_truncated: bool
+
+
+class TypeQueryResult(TypedDict):
+    kind: str
+    data: list[TypeCatalogRow]
+    next_offset: int | None
+    total: int
+
+
+class TypeInspectResult(TypedDict, total=False):
+    name: str
+    exists: bool
+    declaration: str
+    size: int
+    is_func: bool
+    is_ptr: bool
+    is_enum: bool
+    is_udt: bool
+    members: list[TypeCatalogMemberResult] | None
+    member_count: int
+    error: str
+
+
+class TypeApplyBatchResult(TypedDict):
+    ok: bool
+    applied: int
+    failed: int
+    stopped: bool
+    results: list[dict[str, Any]]
 
 
 # ============================================================================
@@ -243,6 +326,253 @@ def search_structs(
     return results
 
 
+def _type_kind(tif: ida_typeinf.tinfo_t) -> str:
+    try:
+        if tif.is_enum():
+            return "enum"
+    except Exception:
+        pass
+    try:
+        if tif.is_typedef():
+            return "typedef"
+    except Exception:
+        pass
+    try:
+        if tif.is_func():
+            return "func"
+    except Exception:
+        pass
+    try:
+        if tif.is_ptr():
+            return "ptr"
+    except Exception:
+        pass
+    try:
+        if tif.is_udt():
+            udt = ida_typeinf.udt_type_data_t()
+            if tif.get_udt_details(udt) and udt.is_union:
+                return "union"
+            return "struct"
+    except Exception:
+        pass
+    return "other"
+
+
+def _type_matches_kind(kind: str, tif: ida_typeinf.tinfo_t) -> bool:
+    if kind == "any":
+        return True
+    if kind == "udt":
+        try:
+            return bool(tif.is_udt())
+        except Exception:
+            return False
+    return _type_kind(tif) == kind
+
+
+@tool
+@idasync
+def type_query(
+    queries: Annotated[
+        list[TypeQuery] | TypeQuery,
+        "Type catalog query with filtering, pagination, and optional relationships",
+    ],
+) -> list[TypeQueryResult]:
+    """Query local types with structured filters and pagination."""
+    queries = normalize_dict_list(queries)
+
+    catalog: list[dict] = []
+    limit = ida_typeinf.get_ordinal_limit()
+    for ordinal in range(1, limit):
+        tif = ida_typeinf.tinfo_t()
+        if not tif.get_numbered_type(None, ordinal):
+            continue
+        name = tif.get_type_name()
+        if not name:
+            continue
+        catalog.append({
+            "ordinal": ordinal,
+            "name": name,
+            "size": tif.get_size(),
+            "kind": _type_kind(tif),
+            "_tif": tif,
+        })
+
+    results: list[dict] = []
+    for query in queries:
+        filter_pattern = str(query.get("filter", "") or "")
+        kind = str(query.get("kind", "any") or "any").lower()
+        if kind not in {"any", "struct", "union", "enum", "typedef", "func", "ptr", "udt"}:
+            kind = "any"
+
+        offset = int(query.get("offset", 0) or 0)
+        count = int(query.get("count", 100) or 100)
+        sort_by = str(query.get("sort_by", "name") or "name")
+        descending = bool(query.get("descending", False))
+        include_decl = bool(query.get("include_decl", True))
+        include_members = bool(query.get("include_members", False))
+        max_members = int(query.get("max_members", 64) or 64)
+        include_relationships = bool(query.get("include_relationships", False))
+
+        if max_members < 0:
+            max_members = 0
+        if max_members > 4096:
+            max_members = 4096
+
+        filtered = []
+        for row in catalog:
+            tif = row.get("_tif")
+            if isinstance(tif, ida_typeinf.tinfo_t) and _type_matches_kind(kind, tif):
+                filtered.append(row)
+
+        if filter_pattern:
+            filtered = pattern_filter(filtered, filter_pattern, "name")
+
+        if sort_by == "size":
+            filtered.sort(key=lambda r: int(r.get("size", 0) or 0), reverse=descending)
+        elif sort_by == "ordinal":
+            filtered.sort(key=lambda r: int(r.get("ordinal", 0) or 0), reverse=descending)
+        else:
+            filtered.sort(key=lambda r: str(r.get("name", "")).lower(), reverse=descending)
+
+        output_rows: list[dict] = []
+        for row in filtered:
+            tif = row["_tif"]
+            out = {
+                "ordinal": row["ordinal"],
+                "name": row["name"],
+                "size": row["size"],
+                "kind": row["kind"],
+            }
+
+            if include_decl:
+                out["declaration"] = str(tif)
+
+            if include_members:
+                members = []
+                member_count = 0
+                members_truncated = False
+                if tif.is_udt():
+                    udt = ida_typeinf.udt_type_data_t()
+                    if tif.get_udt_details(udt):
+                        member_count = len(udt)
+                        for idx, member in enumerate(udt):
+                            if idx >= max_members:
+                                members_truncated = True
+                                break
+                            members.append({
+                                "name": member.name,
+                                "offset": hex(member.begin() // 8),
+                                "size": member.type.get_size(),
+                                "type": member.type._print(),
+                            })
+                out["member_count"] = member_count
+                out["members"] = members
+                out["members_truncated"] = members_truncated
+
+            if include_relationships:
+                related: set[str] = set()
+                if tif.is_udt():
+                    udt = ida_typeinf.udt_type_data_t()
+                    if tif.get_udt_details(udt):
+                        for member in udt:
+                            rel_name = member.type.get_type_name() or str(member.type)
+                            if rel_name:
+                                related.add(rel_name)
+                if tif.is_ptr():
+                    pointed = ida_typeinf.tinfo_t()
+                    try:
+                        if tif.get_pointed_object(pointed):
+                            rel_name = pointed.get_type_name() or str(pointed)
+                            if rel_name:
+                                related.add(rel_name)
+                    except Exception:
+                        pass
+
+                related_list = sorted(related)
+                out["related_count"] = len(related_list)
+                out["related_types"] = related_list[:256]
+                out["related_truncated"] = len(related_list) > 256
+
+            output_rows.append(out)
+
+        page = paginate(output_rows, offset, count)
+        results.append({
+            "kind": kind,
+            "data": page["data"],
+            "next_offset": page["next_offset"],
+            "total": len(output_rows),
+        })
+
+    return results
+
+
+@tool
+@idasync
+def type_inspect(
+    queries: Annotated[
+        list[TypeInspectQuery] | TypeInspectQuery,
+        "Inspect named types and optionally include member layout",
+    ],
+) -> list[TypeInspectResult]:
+    """Inspect named types with size, kind flags, declaration, and members."""
+    queries = normalize_dict_list(queries)
+    results = []
+
+    for query in queries:
+        name = (query.get("name") or "").strip()
+        include_members = bool(query.get("include_members", False))
+        max_members = int(query.get("max_members", 128) or 128)
+        if max_members < 0:
+            max_members = 0
+        if max_members > 4096:
+            max_members = 4096
+
+        if not name:
+            results.append({"name": name, "exists": False, "error": "Type name is required"})
+            continue
+
+        try:
+            tif = ida_typeinf.tinfo_t()
+            if not tif.get_named_type(None, name):
+                results.append({"name": name, "exists": False, "error": f"Type not found: {name}"})
+                continue
+
+            info = {
+                "name": name,
+                "exists": True,
+                "declaration": str(tif),
+                "size": tif.get_size(),
+                "is_func": tif.is_func(),
+                "is_ptr": tif.is_ptr(),
+                "is_enum": tif.is_enum(),
+                "is_udt": tif.is_udt(),
+                "members": None,
+                "member_count": 0,
+            }
+
+            if include_members and tif.is_udt():
+                udt = ida_typeinf.udt_type_data_t()
+                if tif.get_udt_details(udt):
+                    info["member_count"] = len(udt)
+                    members = []
+                    for idx, member in enumerate(udt):
+                        if idx >= max_members:
+                            break
+                        members.append({
+                            "name": member.name,
+                            "offset": hex(member.begin() // 8),
+                            "size": member.type.get_size(),
+                            "type": member.type._print(),
+                        })
+                    info["members"] = members
+
+            results.append(info)
+        except Exception as e:
+            results.append({"name": name, "exists": False, "error": str(e)})
+
+    return results
+
+
 # ============================================================================
 # Type Inference & Application
 # ============================================================================
@@ -379,6 +709,47 @@ def set_type(edits: list[TypeEdit] | TypeEdit) -> list[dict]:
             results.append({"edit": edit, "error": str(e)})
 
     return results
+
+
+def _parse_addr_type_shorthand(s: str) -> dict:
+    if ":" in s:
+        addr, ty = s.split(":", 1)
+        return {"addr": addr.strip(), "ty": ty.strip()}
+    return {"ty": s.strip()}
+
+
+@tool
+@idasync
+def type_apply_batch(
+    batch: Annotated[
+        TypeApplyBatch,
+        "Batch type edits with optional stop_on_error behavior",
+    ],
+) -> TypeApplyBatchResult:
+    """Apply multiple type edits and return aggregate status."""
+    normalized_edits = normalize_dict_list(
+        batch.get("edits", []), _parse_addr_type_shorthand
+    )
+    stop_on_error = bool(batch.get("stop_on_error", False))
+
+    results: list[dict] = []
+    set_type_impl = getattr(set_type, "__wrapped__", set_type)
+    for edit in normalized_edits:
+        result_list = set_type_impl([edit])
+        result = result_list[0] if result_list else {"edit": edit, "error": "No result"}
+        results.append(result)
+        if stop_on_error and result.get("error"):
+            break
+
+    failed = sum(1 for r in results if r.get("error"))
+    applied = sum(1 for r in results if r.get("ok"))
+    return {
+        "ok": failed == 0,
+        "applied": applied,
+        "failed": failed,
+        "stopped": stop_on_error and failed > 0,
+        "results": results,
+    }
 
 
 @tool
